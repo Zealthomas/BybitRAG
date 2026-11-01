@@ -1,171 +1,268 @@
-# ========== IMPORTS ==========
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import uvicorn
+from __future__ import annotations
+
+import logging
 import os
+import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import List, Optional
+
 import requests
+import uvicorn
 from bs4 import BeautifulSoup
-
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_ollama import OllamaLLM
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from langchain.chains import RetrievalQA
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain_ollama import OllamaLLM
 
-# ========== GLOBALS ==========
-persist_dir = "faiss_db"
+BASE_DIR = Path(__file__).resolve().parent
+PERSIST_DIR = BASE_DIR / os.getenv("PERSIST_DIR", "faiss_db")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
 
-embedding_model = None
-llm = None
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+embedding_model: Optional[HuggingFaceEmbeddings] = None
+llm: Optional[OllamaLLM] = None
 retriever = None
+vector_db = None
 
-# ========== HELPERS ==========
-def fetch_and_extract_text(url):
-    print(f"Fetching URL: {url}")
-    headers = {"User-Agent": "BybitRAGBot/1.0"}
-    resp = requests.get(url, headers=headers, timeout=10)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+DEFAULT_URLS = [
+    "https://bybit-exchange.github.io/docs",
+    "https://www.bybit.com/en/help-center/",
+    "https://www.bybit.com/en/announcement/",
+    "https://www.bybit.com/en/learn/",
+    "https://www.bybit.com/en-US/legal/terms-of-service",
+    "https://www.bybit.com/en/fees/",
+    "https://blog.bybit.com/",
+    "https://www.bybit.com/en-US/affiliate",
+]
 
-    main_content = soup.find("div", {"class": "article-body"}) or soup.body
 
-    for tag in main_content(["script", "style", "nav", "footer", "header", "aside"]):
+def ensure_persist_dir() -> None:
+    PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def init_models() -> None:
+    global embedding_model, llm
+
+    if embedding_model is None:
+        try:
+            embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+            logging.info("Embedding model initialized.")
+        except Exception as exc:
+            logging.warning("Embedding model initialization failed: %s", exc)
+            embedding_model = None
+
+    if llm is None:
+        try:
+            llm = OllamaLLM(model=OLLAMA_MODEL)
+            logging.info("Ollama model initialized.")
+        except Exception as exc:
+            logging.warning("Ollama model initialization failed: %s", exc)
+            llm = None
+
+
+def load_vector_db() -> Optional[FAISS]:
+    global vector_db
+    if not PERSIST_DIR.exists() or not any(PERSIST_DIR.iterdir()):
+        return None
+    if embedding_model is None:
+        return None
+    try:
+        db = FAISS.load_local(str(PERSIST_DIR), embedding_model, allow_dangerous_deserialization=True)
+        vector_db = db
+        return db
+    except Exception as exc:
+        logging.warning("Failed to load FAISS index; rebuilding: %s", exc)
+        if PERSIST_DIR.exists():
+            shutil.rmtree(PERSIST_DIR)
+        return None
+
+
+def extract_main_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    selectors = [
+        "article",
+        "main",
+        ".article-body",
+        ".content",
+        ".entry-content",
+        "#content",
+        "#main-content",
+    ]
+    main_content = None
+    for selector in selectors:
+        main_content = soup.select_one(selector)
+        if main_content is not None:
+            break
+    if main_content is None:
+        main_content = soup.body or soup
+
+    for tag in main_content.find_all(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
         tag.decompose()
 
     text = main_content.get_text(separator="\n", strip=True)
-    print(f"Extracted {len(text)} characters of text from {url}")
+    return " ".join(text.split())
+
+
+def fetch_and_extract_text(url: str) -> str:
+    headers = {"User-Agent": "BybitRAGBot/1.0"}
+    response = requests.get(url, headers=headers, timeout=20)
+    response.raise_for_status()
+    text = extract_main_text(response.text)
+    if not text or len(text) < 100:
+        raise ValueError(f"No usable content found at {url}")
     return text
 
-def ingest_documents(urls):
-    print("Starting document ingestion...")
-    texts = []
-    metadatas = []
+
+def create_documents_from_urls(urls: List[str]) -> List[Document]:
+    documents: List[Document] = []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
     for url in urls:
         try:
-            text = fetch_and_extract_text(url)
-            if text.strip():
-                texts.append(text)
-                metadatas.append({"source": url})
-            else:
-                print(f"Warning: No extractable text from {url}")
-        except Exception as e:
-            print(f"Failed to fetch {url}: {e}")
+            content = fetch_and_extract_text(url)
+            chunks = splitter.split_text(content)
+            for chunk in chunks:
+                documents.append(Document(page_content=chunk, metadata={"source": url}))
+            logging.info("Indexed %s chunks from %s", len(chunks), url)
+        except Exception as exc:
+            logging.warning("Failed to index %s: %s", url, exc)
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    docs = []
-    for i, text in enumerate(texts):
-        chunks = text_splitter.split_text(text)
-        for chunk in chunks:
-            docs.append(Document(page_content=chunk, metadata=metadatas[i]))
+    if not documents:
+        raise ValueError("No documents were successfully extracted from the provided URLs")
 
-    print(f"Total chunks created: {len(docs)}")
+    return documents
 
+
+def ingest_documents(urls: List[str]) -> FAISS:
+    global vector_db
+    if embedding_model is None:
+        raise RuntimeError("Embedding model is not initialized")
+
+    docs = create_documents_from_urls(urls)
     db = FAISS.from_documents(docs, embedding_model)
-    db.save_local(persist_dir)
-    print(f"FAISS index saved to {persist_dir}")
+    ensure_persist_dir()
+    db.save_local(str(PERSIST_DIR))
+    vector_db = db
+    logging.info("Vector store saved to %s", PERSIST_DIR)
     return db
 
-# ========== LIFESPAN HANDLER ==========
+
+def ensure_retriever() -> None:
+    global retriever
+    if vector_db is not None:
+        retriever = vector_db.as_retriever(search_kwargs={"k": 4})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, llm, retriever
+    global vector_db, retriever
+    init_models()
 
-    if embedding_model is None:
-        print("Initializing embedding model and LLM...")
-        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        llm = OllamaLLM(model="mistral")
-        print("Embedding model and LLM initialized.")
-
-    if not os.path.exists(persist_dir):
-        print("No existing FAISS index found, ingesting documents...")
-        db = ingest_documents([
-            "https://bybit-exchange.github.io/docs",
-            "https://www.bybit.com/en/help-center/",
-            "https://www.bybit.com/en/announcement/",
-            "https://www.bybit.com/en/learn/",
-            "https://www.bybit.com/en-US/legal/terms-of-service",
-            "https://www.bybit.com/en/fees/",
-            "https://blog.bybit.com/",
-            "https://www.bybit.com/en-US/affiliate"
-        ])
-    else:
-        print(f"Loading existing FAISS index from {persist_dir}...")
-        db = FAISS.load_local(persist_dir, embedding_model, allow_dangerous_deserialization=True)
-        print("FAISS index loaded successfully.")
-
-    retriever = db.as_retriever()
-    print("Retriever is ready.")
+    if embedding_model is not None:
+        db = load_vector_db()
+        if db is None:
+            try:
+                db = ingest_documents(DEFAULT_URLS)
+            except Exception as exc:
+                logging.warning("Failed to build initial database: %s", exc)
+                db = None
+        vector_db = db
+        if db is not None:
+            ensure_retriever()
 
     yield
-    # (You can add shutdown code here if needed)
 
-# ========== APP SETUP ==========
+
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ========== INGEST ENDPOINT ==========
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "embedding_ready": embedding_model is not None,
+        "llm_ready": llm is not None,
+        "vector_db_ready": vector_db is not None,
+        "persist_dir": str(PERSIST_DIR),
+    }
+
+
 @app.post("/ingest")
 async def ingest_endpoint(request: Request):
-    global retriever
+    global vector_db, retriever
     try:
-        url = request.query_params.get("url")
-        print(f"Received /ingest request with URL: {url}")
-        if not url:
-            return JSONResponse(status_code=400, content={"error": "Missing URL"})
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception:
+        body = {}
 
-        db = ingest_documents([url])
-        retriever = db.as_retriever()
-        print("Manual ingestion complete.")
+    url = body.get("url") or request.query_params.get("url")
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "Missing URL"})
+
+    if embedding_model is None:
+        return JSONResponse(status_code=503, content={"error": "Embedding model is unavailable"})
+
+    try:
+        docs = create_documents_from_urls([url])
+        if vector_db is None:
+            vector_db = FAISS.from_documents(docs, embedding_model)
+        else:
+            vector_db.add_documents(docs)
+        ensure_persist_dir()
+        vector_db.save_local(str(PERSIST_DIR))
+        ensure_retriever()
         return {"status": "success", "message": f"Ingested content from {url}"}
+    except Exception as exc:
+        logging.exception("Manual ingest failed")
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
-    except Exception as e:
-        print(f"Error in /ingest endpoint: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
 
-# ========== CHAT ENDPOINT ==========
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     try:
-        data = await request.json()
-        print(f"/chat received data: {data}")
-        query = data.get("query", "").strip()
+        body = await request.json()
+    except Exception:
+        body = {}
 
-        if not query:
-            print("Empty query received.")
-            return JSONResponse(status_code=400, content={"error": "Query is required"})
+    query = (body or {}).get("query") or request.query_params.get("query") or ""
+    if not query or not query.strip():
+        return JSONResponse(status_code=400, content={"error": "Query is required"})
 
-        if retriever is None:
-            print("Retriever not initialized.")
-            return JSONResponse(status_code=500, content={"error": "Retriever not initialized"})
+    if llm is None or retriever is None:
+        return JSONResponse(status_code=503, content={"error": "LLM or retriever is not ready"})
 
-        print("Running retrieval QA chain...")
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            retriever=retriever,
-            return_source_documents=False
-        )
+    try:
+        qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+        result = qa_chain.invoke({"query": query})
+        answer = result.get("result") if isinstance(result, dict) else str(result)
+        sources = []
+        if isinstance(result, dict):
+            for doc in result.get("source_documents", []):
+                sources.append({
+                    "source": doc.metadata.get("source", "unknown"),
+                    "snippet": doc.page_content[:200],
+                })
+        return {"response": answer, "sources": sources}
+    except Exception as exc:
+        logging.exception("Chat request failed")
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
-        response = qa_chain.run(query)
-        print(f"Query response: {response}")
-        return {"response": response}
 
-    except Exception as e:
-        print(f"Error in /chat endpoint: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-
-# ========== RUN APP LOCALLY ==========
 if __name__ == "__main__":
-    print("Starting FastAPI app...")
     uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=True)
-
-# ========== END OF FILE ==========
