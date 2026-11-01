@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  bybitrag:
+    build: .
+    container_name: bybitrag
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+    restart: unless-stopped
