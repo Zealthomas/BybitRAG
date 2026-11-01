@@ -15,21 +15,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from langchain.chains import RetrievalQA
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_ollama import OllamaLLM
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 BASE_DIR = Path(__file__).resolve().parent
 PERSIST_DIR = BASE_DIR / os.getenv("PERSIST_DIR", "faiss_db")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/embedding-001")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-embedding_model: Optional[HuggingFaceEmbeddings] = None
-llm: Optional[OllamaLLM] = None
+embedding_model: Optional[GoogleGenerativeAIEmbeddings] = None
+llm: Optional[ChatGoogleGenerativeAI] = None
 retriever = None
 vector_db = None
 
@@ -52,20 +52,32 @@ def ensure_persist_dir() -> None:
 def init_models() -> None:
     global embedding_model, llm
 
+    if not GEMINI_API_KEY:
+        logging.warning("GEMINI_API_KEY is not set. Gemini pipeline is disabled.")
+        return
+
     if embedding_model is None:
         try:
-            embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-            logging.info("Embedding model initialized.")
+            embedding_model = GoogleGenerativeAIEmbeddings(
+                model=EMBEDDING_MODEL,
+                google_api_key=GEMINI_API_KEY,
+            )
+            logging.info("Gemini embedding model initialized.")
         except Exception as exc:
-            logging.warning("Embedding model initialization failed: %s", exc)
+            logging.warning("Gemini embedding initialization failed: %s", exc)
             embedding_model = None
 
     if llm is None:
         try:
-            llm = OllamaLLM(model=OLLAMA_MODEL)
-            logging.info("Ollama model initialized.")
+            llm = ChatGoogleGenerativeAI(
+                model=GEMINI_MODEL,
+                google_api_key=GEMINI_API_KEY,
+                temperature=0.2,
+                convert_system_message_to_human=True,
+            )
+            logging.info("Gemini LLM initialized.")
         except Exception as exc:
-            logging.warning("Ollama model initialization failed: %s", exc)
+            logging.warning("Gemini LLM initialization failed: %s", exc)
             llm = None
 
 
@@ -196,8 +208,8 @@ app.add_middleware(
 async def health():
     return {
         "status": "ok",
+        "gemini_ready": llm is not None,
         "embedding_ready": embedding_model is not None,
-        "llm_ready": llm is not None,
         "vector_db_ready": vector_db is not None,
         "persist_dir": str(PERSIST_DIR),
     }
@@ -216,7 +228,7 @@ async def ingest_endpoint(request: Request):
         return JSONResponse(status_code=400, content={"error": "Missing URL"})
 
     if embedding_model is None:
-        return JSONResponse(status_code=503, content={"error": "Embedding model is unavailable"})
+        return JSONResponse(status_code=503, content={"error": "Gemini embedding model is unavailable"})
 
     try:
         docs = create_documents_from_urls([url])
@@ -245,7 +257,7 @@ async def chat_endpoint(request: Request):
         return JSONResponse(status_code=400, content={"error": "Query is required"})
 
     if llm is None or retriever is None:
-        return JSONResponse(status_code=503, content={"error": "LLM or retriever is not ready"})
+        return JSONResponse(status_code=503, content={"error": "Gemini or retriever is not ready"})
 
     try:
         qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
